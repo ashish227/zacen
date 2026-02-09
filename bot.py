@@ -1,6 +1,8 @@
+from utils.database import init_db
+import os
+import asyncio
 import discord
 from discord.ext import commands
-import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,15 +10,23 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
-intents.messages = True
 intents.message_content = True
+intents.guilds = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=".", intents=intents)
+
 
 @bot.event
 async def on_ready():
+    init_db()
     print(f"Logged in as {bot.user}")
 
-bot.load_extension("cogs.poketwo_listener")
 
-bot.run(TOKEN)
+async def main():
+    async with bot:
+        await bot.load_extension("cogs.poketwo_listener")
+        await bot.load_extension("cogs.user_commands")
+        await bot.start(TOKEN)
+
+
+asyncio.run(main())
