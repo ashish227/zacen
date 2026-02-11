@@ -1,6 +1,7 @@
 from discord.ext import commands
 import discord
 
+
 class ChannelManager(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -27,11 +28,11 @@ class ChannelManager(commands.Cog):
                 channel_name = str(i)
                 if channel_name not in existing_channels:
                     await guild.create_text_channel(
-                        name=channel_name,
-                        category=category
+                        name=channel_name, category=category
                     )
 
         await ctx.send("✅ Channels created or verified.")
+
 
 def setup(bot):
     bot.add_cog(ChannelManager(bot))
