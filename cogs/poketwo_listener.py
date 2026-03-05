@@ -1,3 +1,14 @@
+"""
+cogs/poketwo_listener.py
+
+Listens for Pokétwo spawns, identifies via API, always hints (lowercase).
+Pings format (only when there are hunters/collectors):
+    pikachu
+    shiny hunts: @user1 @user2
+    collection pings: @user3 @role1
+"""
+
+import asyncio
 import time
 import discord
 from discord.ext import commands
@@ -6,113 +17,129 @@ from utils.pokemon_api import identify_pokemon
 from utils.database import (
     get_all_shiny_hunters,
     get_all_collectors,
+    get_role_pings,
     is_afk,
     is_shiny_enabled,
     is_collection_enabled,
+    is_pings_enabled,
 )
 
 POKETWO_ID = 716390085896962058
-PROCESS_TTL = 600  # 10 minutes
+PROCESSED_TTL = 600
+MAX_CONCURRENT = 20
+API_RETRIES = 3
+RETRY_DELAY = 1.0
 
 
 class PoketwoListener(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.processed: dict[tuple[int, int], float] = {}
+        self.processing: set[tuple[int, int]] = set()
+        self._sem = asyncio.Semaphore(MAX_CONCURRENT)
 
-        # image_url -> timestamp
-        self.processed_images: dict[str, float] = {}
-        self.processing_images: set[str] = set()
-
-    def _cleanup_old(self):
+    def _cleanup(self):
         now = time.time()
-        expired = [
-            url for url, ts in self.processed_images.items()
-            if now - ts > PROCESS_TTL
-        ]
-        for url in expired:
-            del self.processed_images[url]
+        for k in [k for k, ts in self.processed.items() if now - ts > PROCESSED_TTL]:
+            del self.processed[k]
+
+    def _is_spawn(self, embed: discord.Embed) -> bool:
+        if not embed.title:
+            return False
+        t = embed.title.lower()
+        return "wild" in t and "appeared" in t
+
+    def _get_image(self, embed: discord.Embed) -> str | None:
+        return embed.image.url if embed.image and embed.image.url else None
+
+    async def _identify_with_retry(self, image_url: str) -> str | None:
+        for attempt in range(1, API_RETRIES + 1):
+            result = await identify_pokemon(image_url)
+            if result:
+                return result
+            if attempt < API_RETRIES:
+                print(f"[RETRY] Attempt {attempt} failed, retrying in {RETRY_DELAY}s...")
+                await asyncio.sleep(RETRY_DELAY)
+        return None
 
     async def process_spawn(self, message: discord.Message):
-        self._cleanup_old()
-
         if not message.embeds:
             return
 
-        for embed in message.embeds:
-            if not embed.title:
-                continue
+        spawn_embed = next((e for e in message.embeds if self._is_spawn(e)), None)
+        if not spawn_embed:
+            return
 
-            title = embed.title.lower()
-            if "wild" not in title or "appeared" not in title:
-                continue
+        image_url = self._get_image(spawn_embed)
+        if not image_url:
+            return
 
-            if not embed.image or not embed.image.url:
-                continue
+        key = (message.channel.id, message.id)
+        self._cleanup()
 
-            image_url = embed.image.url
+        if key in self.processed or key in self.processing:
+            return
 
-            if image_url in self.processed_images:
-                continue
+        self.processing.add(key)
 
-            if image_url in self.processing_images:
-                continue
+        try:
+            async with self._sem:
+                print(f"[SPAWN] ch={message.channel.id} msg={message.id}")
 
-            self.processing_images.add(image_url)
-            hint_sent = False
+                pokemon = await self._identify_with_retry(image_url)
 
-            try:
-                print(f"[SPAWN] Image detected: {image_url}")
-
-                pokemon = await identify_pokemon(image_url)
                 if not pokemon:
-                    print("[HINT] No Pokémon identified")
-                    continue
+                    print(f"[FAIL] Could not identify in ch={message.channel.id}")
+                    await message.reply("❓")
+                    return
 
-                pokemon = pokemon.strip().lower()
-                print(f"[API] Result: {pokemon}")
+                pokemon_lower = pokemon.strip().lower()
+                print(f"[IDENTIFIED] {pokemon_lower}")
 
-                shiny_users = get_all_shiny_hunters(pokemon)
-                collection_users = get_all_collectors(pokemon)
+                # Always hint first line — always lowercase
+                lines = [pokemon_lower]
 
-                ping_ids = set()
+                # Only add pings if channel allows it
+                if is_pings_enabled(message.channel.id):
+                    # Shiny hunters
+                    shiny_mentions = [
+                        f"<@{uid}>"
+                        for uid in get_all_shiny_hunters(pokemon_lower)
+                        if is_shiny_enabled(uid) and not is_afk(uid)
+                    ]
 
-                for uid in shiny_users:
-                    if is_shiny_enabled(uid) and not is_afk(uid):
-                        ping_ids.add(uid)
+                    # Collectors
+                    collection_mentions = [
+                        f"<@{uid}>"
+                        for uid in get_all_collectors(pokemon_lower)
+                        if is_collection_enabled(uid) and not is_afk(uid)
+                    ]
 
-                for uid in collection_users:
-                    if is_collection_enabled(uid) and not is_afk(uid):
-                        ping_ids.add(uid)
+                    # Role pings
+                    if message.guild:
+                        for rid in get_role_pings(message.guild.id, pokemon_lower):
+                            collection_mentions.append(f"<@&{rid}>")
 
-                content = pokemon
-                if ping_ids:
-                    mentions = " ".join(f"<@{uid}>" for uid in ping_ids)
-                    content += "\n" + mentions
+                    # Only add ping lines if there's actually someone to ping
+                    if shiny_mentions:
+                        lines.append(f"shiny hunts: {' '.join(shiny_mentions)}")
+                    if collection_mentions:
+                        lines.append(f"collection pings: {' '.join(collection_mentions)}")
 
-                await message.reply(content)
-                print(f"[HINT] Sent: {pokemon}")
+                await message.reply("\n".join(lines))
+                print(f"[HINT] '{pokemon_lower}' in ch={message.channel.id}")
+                self.processed[key] = time.time()
 
-                hint_sent = True
-
-            except Exception as e:
-                print("[PROCESS ERROR]", e)
-
-            finally:
-                self.processing_images.discard(image_url)
-                if hint_sent:
-                    self.processed_images[image_url] = time.time()
+        except Exception as e:
+            print(f"[ERROR] process_spawn: {e}")
+        finally:
+            self.processing.discard(key)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.id != POKETWO_ID:
             return
-        await self.process_spawn(message)
-
-    @commands.Cog.listener()
-    async def on_message_edit(self, before, after):
-        if after.author.id != POKETWO_ID:
-            return
-        await self.process_spawn(after)
+        asyncio.create_task(self.process_spawn(message))
 
 
 async def setup(bot: commands.Bot):
